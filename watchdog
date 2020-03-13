@@ -1,0 +1,675 @@
+#!/bin/bash
+
+auto_flag="false"
+
+declare -A cctv
+
+function wait_other()
+{
+    if [ -f "${local_dir}${wait_file}" ]; then
+        echo_with_log "wait other recoding task"
+    fi
+    while [ -f "${local_dir}${wait_file}" ]
+    do
+        sleep 3
+    done
+    touch "${local_dir}${wait_file}"
+}
+
+function echo_to_log()
+{
+    local time=$(date +%Y-%m-%d)
+    local name="log_${time}.log"
+    local log_name="${logs_dir}${name}"
+    if [ ! -f "${logs_name}" ]; then
+        touch "${log_name}"
+        chmod o-r "${log_name}"
+    fi
+    echo "${*:1}" >> "${log_name}"
+}
+
+function echo_with_log()
+{
+    if [ "$*" != "" ]; then
+        for draft_str in "$@"; do
+            echo "${draft_str}"
+            echo_to_log "${draft_str}"
+        done
+    else
+        echo ""
+        echo_to_log ""
+    fi
+}
+
+function read_config()
+{
+
+    local script_path=`readlink -e $0`
+    local script_dir=`dirname "${script_path}"`
+    local config_file="${script_dir}/config"
+    if [ -f "${config_file}" ]; then
+        local_dir=`cat "${config_file}" | grep local_dir$(printf '\t') | awk '{print $2}'`
+        records_dir=`cat "${config_file}" | grep records_dir$(printf '\t') | awk '{print $2}'`
+        logs_dir=`cat "${config_file}" | grep logs_dir$(printf '\t') | awk '{print $2}'`
+        cctv_config=`cat "${config_file}" | grep cctv_config$(printf '\t') | awk '{print $2}'`
+        wait_file=`cat "${config_file}" | grep wait_file$(printf '\t') | awk '{print $2}'`
+        force_file=`cat "${config_file}" | grep force_file$(printf '\t') | awk '{print $2}'`
+        resolution=`cat "${config_file}" | grep resolution$(printf '\t') | awk '{print $2}'`
+        fps=`cat "${config_file}" | grep fps$(printf '\t') | awk '{print $2}'`
+        script_command="$0 $*"
+        script_params="$*"
+        USER=`cat "${config_file}" | grep USER$(printf '\t') | awk '{print $2}'`
+        emails=`cat "${config_file}" | grep emails$(printf '\t') | awk '{print $2}'`
+        cctv_reboot_hour_start=`cat "${config_file}" | grep cctv_reboot_start$(printf '\t') | awk '{print $2}' | cut -d ":" -f1`
+        cctv_reboot_hour_stop=`cat "${config_file}" | grep cctv_reboot_stop$(printf '\t') | awk '{print $2}' | cut -d ":" -f1`
+        cctv_reboot_min_start=`cat "${config_file}" | grep cctv_reboot_start$(printf '\t') | awk '{print $2}' | cut -d ":" -f2`
+        cctv_reboot_min_stop=`cat "${config_file}" | grep cctv_reboot_stop$(printf '\t') | awk '{print $2}' | cut -d ":" -f2`
+    else
+        echo "ERROR. No config file!"
+        echo ""
+        exit 53
+    fi
+}
+
+function read_cctv()
+{
+    if [ ! -f "${local_dir}$cctv_config" ]; then
+        echo_with_log "cctv config file does not exist"
+        exit 53
+    fi
+    while read cctv_str
+    do
+        name=`echo $cctv_str|awk '{print $1}'`
+        url=`echo $cctv_str|awk '{print $2}'`
+        cctv[$name]=$url
+    done < "${local_dir}${cctv_config}"
+    auto_flag="false"
+}
+
+function cam_config_state()
+{
+    echo $(cat "${local_dir}$cctv_config"|grep $1$(printf '\t')|awk '{print $3}')
+}
+
+
+function cam_real_state_bool()
+{
+    local real_status="$(/usr/bin/find ${records_dir}cam_$1*.avi -mmin -1 -exec echo "{}" \; | wc -l)"
+    if [[ "$(screen -ls | grep cctv-$1| wc -l)" != "0" ]] && [[ "${real_status}" != "0" ]] ; then
+        echo "1"
+    else
+        echo "0"
+    fi
+}
+
+function cam_real_state()
+{
+    if [ $(cam_real_state_bool "${cam}") == "1" ]; then
+        echo_with_log "${1}: recording"
+    else
+        echo_with_log "${1}: idle"
+    fi
+}
+
+function stop_record()
+{
+    if [ $(cam_real_state_bool "$1") == "1" ]; then
+        screen -S "cctv-${1}" -p 0 -X quit
+        echo_with_log "Stopped $1"
+    else
+        if [ "$(screen -ls | grep cctv-$1| wc -l)" != "0" ]; then
+            echo_with_log "ERROR"
+            echo_with_log "$1 bug - not stopped"
+            screen -S "cctv-${1}" -p 0 -X quit
+        else
+            echo_with_log "$1 is already stopped"
+        fi
+    fi
+    local record_name=$(ls -altr "${records_dir}" | grep "$1" | tail -n1 | awk '{print $9}')
+    sudo /bin/chown "cctv:cctv-$1" "${records_dir}${record_name}"
+    sudo /bin/chown "cctv:cctv-all" "${records_dir}"
+    chmod o-r "${records_dir}${record_name}"
+}
+
+function start_record()
+{
+    stop_record "$1"
+    if [ "$(cam_config_state "$1")" ==  "enable" ]; then
+        local time=$(date +%Y_%m_%d_%H_%M)
+        local name="cam_${1}_${time}.avi"
+        if [ -f "${name}" ]; then
+            local i=0
+            while [ -f "${name}" ]; do
+                ((i++))
+                name="cam_${1}_${time}_${i}.avi"
+            done
+        fi
+        screen -S "cctv-${1}" -d -m -- avconv -i "${2}" -s "$resolution" -r "$fps" "${records_dir}${name}"
+        echo_with_log "Started $1"
+    else
+        echo_with_log "$1 recording is manually stopped"
+    fi
+}
+
+function cam_check()
+{
+    if [ -f "/tmp/cctv_reboot_flag" ]; then
+        if [ -f "/tmp/cctv_reboot_flag_off" ]; then
+            if [[ "$(cam_config_state "$1")" == "enable" ]] && [[ "$(cam_real_state_bool "$1")" == "0" ]] && [[ "$(cat /tmp/cctv_reboot_flag_off | grep $1 | wc -l)" == "0" ]] ; then
+                echo "$1" >> "/tmp/cctv_reboot_flag_off"
+            fi
+        fi
+        if [ -f "/tmp/cctv_reboot_flag_on" ]; then
+            local is_powered_off="0"
+            if [ -f "/tmp/cctv_reboot_flag_off" ]; then
+                if [ "$(cat /tmp/cctv_reboot_flag_off | grep $1 | wc -l)" == "1" ]; then
+                    is_powered_off="1"
+                fi
+            else
+                is_powered_off="1"
+            fi
+            if [[ "$(cam_config_state "$1")" == "enable" ]] && [[ "${is_powered_off}" == "1" ]] ; then
+                if [ "$(cam_real_state_bool "$1")" == "1" ]; then
+                    if [ "$(cat /tmp/cctv_reboot_flag_on | grep $1 | wc -l)" == "0" ]; then
+                        echo "$1" >> "/tmp/cctv_reboot_flag_on"
+                    fi
+                else
+                    start_record "$1" "${cctv[$1]}"
+                fi
+            fi
+        fi
+    else
+        if [ "$(cam_real_state_bool "$1")" == "1" ] ; then
+            if [ "$(cam_config_state "$1")" ==  "enable" ]; then
+                echo "$1 is recorded"
+            else
+                echo_with_log "$1 is recorded once"
+            fi
+        else
+            if [ "$(cam_config_state "$1")" ==  "enable" ]; then
+                echo_with_log "$1 recording forcedly stopped"
+                echo "$(date +%d-%m-%Y) $(date +%H:%M): $1 recording forcedly stopped" >> /tmp/cctv_mail_tmp
+                echo_with_log "Record restarted"
+                start_record "$1" "${cctv[$1]}"
+            else
+                echo "$1 recording is manually stopped"
+            fi
+        fi
+    fi
+}
+
+function set_cam()
+{
+    local cam_status="$(cam_config_state "$1")"
+    local new_status="enable"
+    if [[ "$2" == "0" ]]; then
+        new_status="disable"
+    fi
+    if [[ "$cam_status" != "$new_status" ]]; then
+        old_cam_str=`cat "${local_dir}$cctv_config"|grep $1$(printf '\t')`
+        cam_str=`cat "${local_dir}$cctv_config"|grep $1$(printf '\t')|sed "s/$cam_status/$new_status/"`
+        sed -i "s~$old_cam_str~$cam_str~" "${local_dir}$cctv_config"
+        echo_with_log  "$1 set $new_status recording"
+    else
+        echo_with_log "$1 already set $new_status recording"
+    fi
+}
+
+function cctv_restart()
+{
+    if [ "$1" = "" ]; then
+        for cam in "${!cctv[@]}"; do
+            start_record "${cam}" "${cctv[${cam}]}"
+        done
+    else
+        for cam in ${*:1}; do
+            if [ ${cctv[${cam}]+_} ]; then
+                start_record "${cam}" "${cctv[${cam}]}"
+            else
+                echo_with_log "${cam}: no such camera"
+            fi
+        done
+    fi
+}
+
+function cctv_status()
+{
+    if [ "$1" = "" ]; then
+        for cam in "${!cctv[@]}"; do
+            cam_real_state "${cam}"
+        done
+    else
+        for cam in ${*:1}; do
+            if [ ${cctv[${cam}]+_} ]; then
+                cam_real_state "${cam}"
+            else
+                echo_with_log "${cam}: no such camera"
+            fi
+        done
+    fi
+}
+
+function cctv_check()
+{
+    if [ "$1" = "" ]; then
+        rm -f /tmp/cctv_mail_tmp
+        local now_min=$(date +%M)
+        local now_hour=$(date +%H)
+        if [[ "${now_hour}" == "${cctv_reboot_hour_start}" ]] && [[ "${now_min}" == "${cctv_reboot_min_start}" ]] ; then
+            rm -f "/tmp/cctv_reboot_mail"
+            rm -f "/tmp/cctv_reboot_flag"
+            rm -f "/tmp/cctv_reboot_flag_off"
+            rm -f "/tmp/cctv_reboot_flag_on"
+            echo "cctv reboot at $(date +%d-%m-%Y) $(date +%H:%M)" >> "/tmp/cctv_reboot_mail"
+            touch "/tmp/cctv_reboot_flag"
+            touch "/tmp/cctv_reboot_flag_off"
+            touch "/tmp/cctv_reboot_flag_on"
+            echo_with_log "Reboot started"
+        fi
+        for cam in "${!cctv[@]}"; do
+            cam_check "${cam}"
+        done
+        # stop time > start time. no variants with 23:00-01:00 (AND NOW COLLISION WITH RESTART ON **:00)
+        if [[ -f "/tmp/cctv_reboot_flag" ]] && [[ "${now_hour}" -le "${cctv_reboot_hour_stop}" ]] && [[ "${now_min}" -lt "${cctv_reboot_min_stop}" ]] ; then
+            if [ -f "/tmp/cctv_reboot_flag_off" ]; then
+                if [ "$(cat /tmp/cctv_reboot_flag_off | wc -l)" == "$(cat ${local_dir}$cctv_config | grep enable | wc -l)" ]; then
+                    echo_with_log "All cams switched off"
+                    rm -f "/tmp/cctv_reboot_flag_off"
+                fi
+            fi
+            if [ -f "/tmp/cctv_reboot_flag_on" ]; then
+                if [ "$(cat /tmp/cctv_reboot_flag_on | wc -l)" == "$(cat ${local_dir}$cctv_config | grep enable | wc -l)" ]; then
+                    echo_with_log "All cams switched on"
+                    rm -f "/tmp/cctv_reboot_flag_on"
+                    rm -f "/tmp/cctv_reboot_flag"
+                fi
+            fi
+        else
+            if [[ -f "/tmp/cctv_reboot_flag" ]] && [[ "${now_hour}" == "${cctv_reboot_hour_stop}" ]] && [[ "${now_min}" == "${cctv_reboot_min_stop}" ]] ; then
+                # not all reboots good
+                echo_with_log "ERROR REBOOT SMTH BAD"
+                for cam in "${!cctv[@]}"; do
+                    if [ -f "/tmp/cctv_reboot_flag_off" ]; then
+                        if [ "$(cam_config_state "$cam")" ==  "enable" ]; then
+                            if [ "$(cat /tmp/cctv_reboot_flag_off | grep $cam | wc -l)" == "0" ]; then
+                                echo "$cam did not switch off" >> "/tmp/cctv_reboot_mail"
+                                echo_with_log "ERROR REBOOT $cam DID NOT SWITCH OFF"
+                            fi
+                        fi
+                    fi
+                    if [ -f "/tmp/cctv_reboot_flag_on" ]; then
+                        local is_powered_off="0"
+                        if [ -f "/tmp/cctv_reboot_flag_off" ]; then
+                            if [ "$(cat /tmp/cctv_reboot_flag_off | grep $cam | wc -l)" == "1" ]; then
+                                is_powered_off="1"
+                            fi
+                        else
+                            is_powered_off="1"
+                        fi
+                        if [ "$(cam_config_state "$cam")" ==  "enable" ]; then
+                            if [ "${is_powered_off}" == "1" ]; then
+                                if [ "$(cat /tmp/cctv_reboot_flag_on | grep $cam | wc -l)" == "0" ]; then
+                                    echo "$cam switched off, but did not switch on" >> "/tmp/cctv_reboot_mail"
+                                    echo "$cam switched off, but did not switch on" >> "/tmp/cctv_mail_tmp"
+                                    echo_with_log "ERROR REBOOT $cam SWITCHED OFF, BUT DID NOT SWITCH ON"
+                                fi
+                            fi
+                        fi
+                    fi
+                done
+                if [ "$(cat /tmp/cctv_reboot_mail | wc -l)" != "1" ]; then
+                    echo_with_log "ERROR cctv REBOOT FAILED"
+                    mutt -s "cctv REBOOT FAILED" "${emails}" < "/tmp/cctv_reboot_mail"
+                fi
+                rm -f "/tmp/cctv_reboot_mail"
+                rm -f "/tmp/cctv_reboot_flag"
+                rm -f "/tmp/cctv_reboot_flag_off"
+                rm -f "/tmp/cctv_reboot_flag_on"
+            else
+                if [ -f "/tmp/cctv_reboot_mail" ]; then
+                    # all reboots good
+                    echo_with_log "All cams reboot successful"
+                    echo "All cams reboot successful" >> "/tmp/cctv_reboot_mail"
+                    mutt -s "cctv REBOOT SUCCESS" "${emails}" < "/tmp/cctv_reboot_mail"
+                    rm -f "/tmp/cctv_reboot_mail"
+                    rm -f "/tmp/cctv_reboot_flag"
+                    rm -f "/tmp/cctv_reboot_flag_off"
+                    rm -f "/tmp/cctv_reboot_flag_on"
+                fi
+                # normal work
+                if [ -f "/tmp/cctv_mail_tmp" ]; then
+                    if [ ! -f "/tmp/cctv_mail" ]; then
+                        echo_with_log "ERROR DETECTED"
+                        mutt -s "ERROR DETECTED" "${emails}" < "/tmp/cctv_mail_tmp"
+                        mv "/tmp/cctv_mail_tmp" "/tmp/cctv_mail"
+                    else
+                        local check_4_errors="0"
+                        for cam in "${!cctv[@]}"; do
+                            if [ $(cat /tmp/cctv_mail | grep "${cam}" |wc -l) != $(cat /tmp/cctv_mail_tmp | grep "${cam}"  | wc -l) ]; then
+                                check_4_errors="1"
+                            fi
+                        done
+                        if [ "${check_4_errors}" == "1" ]; then
+                            echo_with_log "ERROR CHANGED"
+                            mutt -s "ERROR CHANGED" "${emails}" < /"tmp/cctv_mail_tmp"
+                            mv "/tmp/cctv_mail_tmp" "/tmp/cctv_mail"
+                        fi
+                    fi
+                else
+                    if [ -f "/tmp/cctv_mail" ]; then
+                        echo_with_log "ERROR FIXED"
+                        echo "$(date +%d-%m-%Y) $(date +%H:%M): All cams are ok." > /tmp/cctv_mail
+                        mutt -s "ERROR FIXED" "${emails}" < "/tmp/cctv_mail"
+                        rm "/tmp/cctv_mail"
+                    fi
+                fi
+            fi
+        fi
+    else
+        for cam in ${*:1}; do
+            if [ ${cctv[${cam}]+_} ]; then
+                now_min=$(date +%M)
+                if [ "$now_min" = "00" ]; then
+                    start_record "${cam}" "${cctv[${cam}]}"
+                else
+                    cam_check "${cam}"
+                fi
+            else
+                echo_with_log "${cam}: no such camera"
+            fi
+        done
+    fi
+}
+
+function cctv_enable()
+{
+    if [ "$1" == "" ]; then
+        for cam in "${!cctv[@]}"; do
+            set_cam $cam "1"
+            start_record "${cam}" "${cctv[${cam}]}"
+        done
+    else
+        for cam in ${*:1}; do
+            if [ ${cctv[${cam}]+_} ]; then
+                set_cam $cam "1"
+                start_record "${cam}" "${cctv[${cam}]}"
+            else
+                echo_with_log "${cam}: no such camera"
+            fi
+        done
+    fi
+}
+
+function cctv_disable()
+{
+    if [ "$1" == "" ]; then
+        for cam in "${!cctv[@]}"; do
+            set_cam $cam "0"
+            stop_record "${cam}"
+        done
+    else
+        for cam in ${*:1}; do
+            if [ ${cctv[${cam}]+_} ]; then
+                set_cam $cam "0"
+                stop_record "${cam}"
+            else
+                echo_with_log "${cam}: no such camera"
+            fi
+        done
+    fi
+}
+
+function cctv_delete()
+{
+    if [ $(/usr/bin/find "${logs_dir}"*.log -mtime +31 -exec echo "del: {}" \; | wc -l) != 0 ]; then
+        echo_with_log "$(/usr/bin/find "${logs_dir}"*.log -mtime +31 -exec echo "del: {}" \;)"
+        /usr/bin/find "${logs_dir}"*.log -mtime +31 -exec rm {} \;
+    else
+        echo_with_log "No logs to delete"
+    fi
+    if [ $(/usr/bin/find "${records_dir}"*.avi -mtime +31 -exec echo "del: {}" \;| wc -l) != 0 ]; then
+        echo_with_log "$(/usr/bin/find "${records_dir}"*.avi -mtime +31 -exec echo "del: {}" \;)"
+        /usr/bin/find "${records_dir}"*.avi -mtime +31 -exec rm {} \;
+    else
+        echo_with_log "No records to delete"
+    fi
+}
+
+function cctv_config()
+{
+    if [ "$1" == "" ]; then
+        cat "${local_dir}${cctv_config}"
+    else
+        for cam in ${*:1}; do
+            if [ ${cctv[${cam}]+_} ]; then
+                echo $(cat "${local_dir}${cctv_config}" | grep "${cam}")
+            fi
+        done
+    fi
+}
+
+function cctv_live()
+{
+    if [ "$1" == "" ]; then
+        echo_with_log "Input camera name as a parameter"
+    else
+        for cam in ${*:1}; do
+            if [ ${cctv[${cam}]+_} ]; then
+                sudo -u "${real_user}" mplayer ${cctv[${cam}]} -msglevel all=-1
+            fi
+        done
+    fi      
+}
+
+function cctv_help()
+{
+    echo "Available commands:"
+    echo "enable  [CAMERA]...   - set enable recording of all or specified cameras"
+    echo "disable [CAMERA]...   - set disable recording of all or specified cameras"
+    echo "restart [CAMERA]...   - start recording of all or specified cameras"
+    echo "status  [CAMERA]...   - show state of all or specified cameras"
+    echo "check   [CAMERA]...   - check and resume recording of all or specified cameras"
+    echo "config  [CAMERA]...   - show cctv config of all or specified cameras"
+    echo "log     [LOG_FILE]    - show today or choosen log"
+    echo "error   [LOG_FILE]    - show errors in today or choosen log"
+    echo "delete                - delete records more than 31 days ago"
+    echo "help                  - print this message"
+}
+
+function start_script()
+{
+    case "$1" in
+        restart)
+            cctv_restart ${*:2}
+            echo_with_log ""
+            ;;
+        live)
+            rm "${local_dir}${wait_file}"
+            cctv_live ${*:2}
+            touch "${local_dir}${wait_file}"
+            echo_with_log ""
+            ;;
+        status)
+            cctv_status ${*:2}
+            echo_with_log ""
+            ;;
+        check)
+            cctv_check ${*:2}
+            echo_with_log ""
+            ;;
+        enable)
+            cctv_enable ${*:2}
+            echo_with_log ""
+            ;;
+        disable)
+            cctv_disable ${*:2}
+            echo_with_log ""
+            ;;
+        delete)
+            cctv_delete
+            if [ "${auto_flag}" == "true" ]; then
+                cctv_restart
+            fi
+            echo_with_log ""
+            ;;
+        config)
+            cctv_config ${*:2}
+            echo_with_log ""
+            ;;
+        log|error)
+            log_file=""
+            if [ "$2" == "" ]; then
+                local log_time=$(date +%Y-%m-%d)
+                local log_name="log_${log_time}.log"
+                if [ ! -f "${logs_dir}${log_name}" ]; then
+                    echo "No today logs"
+                    echo_with_log ""
+                    rm "${local_dir}${wait_file}"
+                    exit 53
+                fi
+                log_file="${logs_dir}${log_name}"
+            else
+                log_file="$2"
+            fi
+            echo_with_log ""
+            rm "${local_dir}${wait_file}"
+            if [ "$1" == "error" ]; then
+                cat "${log_file}" | grep ERROR -A5 -B20
+            else
+                less +G "${log_file}"
+            fi
+            touch "${local_dir}${wait_file}"
+            ;;
+        help|*)
+            cctv_help
+            echo_with_log ""
+            ;;
+    esac
+    rm "${local_dir}${wait_file}"
+}
+
+read_config
+
+if [ ! "x$USER" == "x$(whoami)" ]; then
+    if [ -f "/tmp/cctv_tmp_log" ]; then
+        rm -f "/tmp/cctv_tmp_log"
+    fi
+    if [ -f "/tmp/cctv_tmp_user" ]; then
+        rm -f "/tmp/cctv_tmp_user"
+    fi
+    echo "$(whoami)" > "/tmp/cctv_tmp_user"
+    echo "login: $(whoami)" >> "/tmp/cctv_tmp_log"
+    echo "date: $(date)" >> "/tmp/cctv_tmp_log"
+    echo "command: $0 $*" >> "/tmp/cctv_tmp_log"
+    chmod o+r,o+w "/tmp/cctv_tmp_log"
+    chmod o+r,o+w "/tmp/cctv_tmp_user"
+    sudo -u $USER $0 "$@"
+    exit
+else
+    if [ -f "/tmp/cctv_tmp_log" ]; then
+        draft_time=$(date +%Y-%m-%d)
+        draft_name="log_${draft_time}.log"
+        draft_log_name="${logs_dir}${draft_name}"
+        if [ ! -f "${draft_log_name}" ]; then
+            touch "${draft_log_name}"
+            chmod o-r "${draft_log_name}"
+        fi
+        cat "/tmp/cctv_tmp_log" >> "${draft_log_name}"
+        sudo /bin/chown "cctv:cctv-all" "/tmp/cctv_tmp_log"
+        sudo /bin/chown "cctv:cctv-all" "/tmp/cctv_tmp_user"
+        real_user="$(cat /tmp/cctv_tmp_user)"
+    else
+        echo_to_log "login: $(whoami)"
+        echo_to_log "date: $(date)"
+        echo_to_log "command: $0 $*"
+        real_user="$(whoami)"
+    fi
+    read_cctv
+    case "$1" in
+        enable|restart|live|status|check)
+            if [ "$#" == "1" ]; then
+                script_params_cam=""
+                for cam in "${!cctv[@]}"; do
+                    if [ $(sudo -u "${real_user}" groups | grep "${cam}" | wc -l) == 1 ]; then
+                        script_params_cam="${script_params_cam} ${cam}"
+                    fi
+                done
+            else
+                str_bad=""
+                for cam in ${*:2}; do
+                    if [ $(sudo -u "${real_user}" groups | grep "${cam}" | wc -l) == 0 ]; then
+                        if [ "${str_bad}" == "" ]; then
+                            str_bad="${cam}"
+                        else
+                            str_bad="${str_bad}, ${cam}"
+                        fi
+                    fi
+                done
+                if [ "${str_bad}" == "" ]; then
+                    script_params_cam="${*:2}"
+                else
+                    echo "You have no access to cams: ${str_bad}"
+                    echo "You have no access to cams: ${str_bad}" >> "/tmp/cctv_tmp_log"
+                    script_params_cam="ERROR"
+                fi
+            fi
+            ;;
+        disable|config|log|delete)
+            if [ $(sudo -u "${real_user}" groups | grep cctv-adm | wc -l) == 0 ]; then
+                echo "You have no access to this command: $1"
+                echo "You have no access to this command: $1" >> "/tmp/cctv_tmp_log"
+                script_params_cam="ERROR"
+            else
+                script_params_cam="${*:2}"
+            fi
+            ;;
+        *)
+            script_params_cam="${*:2}"
+            ;;
+    esac
+    if [ "${script_params_cam}" == "ERROR" ]; then
+        echo_with_log ""
+        mutt -s "ACCESS DENIED" "${emails}" < "/tmp/cctv_tmp_log"
+        rm -f "/tmp/cctv_tmp_log"
+        exit 53
+    fi
+    rm -f "/tmp/cctv_tmp_log"
+    rm -f "/tmp/cctv_tmp_user"
+fi
+
+wait_other
+
+case "$1" in
+    auto)
+        if [ -f "${local_dir}${force_file}" ]; then
+            echo_with_log "force auto stop detected, exit"
+            echo_with_log ""
+            exit 53
+        fi
+        auto_flag="true"
+        now_min=$(date +%M)
+        now_hour=$(date +%H)
+        # now_min="$4"
+        # now_hour="$3"
+        case "${now_min}" in
+            00)
+                case "${now_hour}" in
+                    23)
+                        script_params="delete"
+                        ;;
+                    *)
+                        script_params="restart"
+                        ;;
+                esac
+                ;;
+            *)
+                script_params="check"
+                ;;
+        esac
+        ;;
+    enable|disable|restart|live|status|check|config|log|error|delete|help|*)
+        script_params="$1"
+        ;;
+esac
+
+start_script "${script_params}" "${script_params_cam}"
